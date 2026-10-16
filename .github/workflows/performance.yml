@@ -1,0 +1,92 @@
+# Runs k6 on every pull request and fails the check when:
+#   1. an absolute threshold (SLO) in k6/ci-perf.js fails  -> k6 exits with 99
+#   2. an endpoint's p95 is much slower than on main        -> compare.py exits with 1
+#
+# main and the PR run back to back in the SAME job, on the SAME runner,
+# so runner-to-runner noise doesn't create false alarms.
+name: performance
+
+on:
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pull-requests: write   # only used to post the results table as a PR comment
+
+concurrency:
+  group: perf-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  K6_VERSION: "2.3.0"
+  PERF_TOLERANCE: "25"      # % slower than main before we fail
+  PERF_MIN_DELTA_MS: "10"   # ...and at least this many ms slower
+  SEED_USERS: "2000"        # background data: 2000 users x 100 items = 200k rows
+  SEED_ITEMS: "100"
+
+jobs:
+  k6:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Check out this PR
+        uses: actions/checkout@v7
+        with:
+          path: pr
+
+      - name: Check out main (the baseline)
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.pull_request.base.sha || 'main' }}
+          path: main
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: |
+            pr/requirements.txt
+            main/requirements.txt
+
+      - name: Install API dependencies
+        run: pip install -r pr/requirements.txt -r main/requirements.txt
+
+      - uses: grafana/setup-k6-action@v1
+        with:
+          k6-version: ${{ env.K6_VERSION }}
+
+      # The baseline only gives us numbers to compare against.
+      # If main already breaks a threshold, that's not this PR's fault, so don't fail here.
+      - name: k6 on main
+        working-directory: pr
+        run: scripts/run-perf.sh ../main ../results/main.json k6/ci-perf.js || echo "main breaks an SLO, see log"
+
+      # Same test script, same seed, same runner. Fails on its own if an SLO threshold breaks.
+      - name: k6 on this PR
+        id: pr_run
+        working-directory: pr
+        run: scripts/run-perf.sh . ../results/pr.json k6/ci-perf.js
+
+      - name: Compare PR vs main
+        if: ${{ !cancelled() && hashFiles('results/main.json') != '' && hashFiles('results/pr.json') != '' }}
+        run: python pr/scripts/compare.py results/main.json results/pr.json
+
+      - name: Post results on the PR
+        # Forks get a read-only token, so skip the comment there (the job summary still has the table).
+        if: ${{ !cancelled() && github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository && hashFiles('results/report.md') != '' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh pr comment ${{ github.event.pull_request.number }} \
+            --repo ${{ github.repository }} \
+            --body-file results/report.md \
+            --edit-last --create-if-none
+
+      - name: Upload k6 results
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: k6-results
+          path: results/
